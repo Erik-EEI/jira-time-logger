@@ -1,0 +1,379 @@
+#!/bin/zsh
+set -euo pipefail
+
+# Shell debug log hiding
+set +x
+unsetopt xtrace verbose 2>/dev/null || true
+
+# Load configuration
+if [[ -f ~/.script/core.sh ]]; then
+    source ~/.script/core.sh
+else
+    echo "Warning: Core configuration not found at ~/.script/core.sh" >&2
+fi
+
+# Constants
+readonly SCRIPT_NAME="$(basename "$0")"
+readonly VERSION="1.0.0-SNAPSHOT"
+readonly DEFAULT_TIME="${JIRA_DEFAULT_TIME:-09:00}"
+readonly MAX_DAILY_HOURS=8
+
+# Global state
+g_date="$(date +%Y-%m-%d)"
+g_ticket=""
+g_time=""
+g_comment=""
+g_range=""
+g_verbose_mode=false
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Core Utilities
+# ═══════════════════════════════════════════════════════════════════════════════
+
+error_exit() { echo "[ERROR] $1" >&2; exit "${2:-1}"; }
+warn() { echo "[WARNING] $1" >&2; }
+info() { echo "$1"; }
+
+validate_date_format() {
+    local date_string="${1:-}"
+    [[ "$date_string" =~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' ]] &&
+    date -j -f "%Y-%m-%d" "$date_string" >/dev/null 2>&1
+}
+
+validate_time_format() {
+    local time_string="${1:-}"
+    [[ "$time_string" =~ '^[0-9]+(\.[0-9]+)?$' ]] &&
+    (( $(echo "$time_string <= 24" | bc -l) ))
+}
+
+clean_json_response() { echo "$1" | tr -d '\000-\031'; }
+is_valid_json() { echo "$1" | jq . >/dev/null 2>&1; }
+sum_numbers() {
+    local numbers="${1:-$(cat)}"
+    [[ -n "$numbers" ]] && echo "$numbers" | paste -sd+ - | bc 2>/dev/null || echo "0"
+}
+seconds_to_hours() { printf "%.2f" "$(bc -l <<< "$1 / 3600")"; }
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Jira API Interface
+# ═══════════════════════════════════════════════════════════════════════════════
+
+jira_api_get() {
+    local endpoint="$1"
+    local url="${JIRA_BASE_URL}${endpoint}"
+
+    curl -sf -X GET \
+        -H "Authorization: Bearer $JIRA_API_TOKEN" \
+        -H "Content-Type: application/json" \
+        "$url" 2>/dev/null || error_exit "Failed to GET $url"
+}
+
+jira_api_post() {
+    local endpoint="$1" data="$2"
+    local url="${JIRA_BASE_URL}${endpoint}"
+
+    curl -s -X POST \
+        -H "Authorization: Bearer $JIRA_API_TOKEN" \
+        -H "Content-Type: application/json" \
+        --data "$data" "$url" 2>/dev/null
+}
+
+get_current_user_sprint_issues() {
+    local jql='sprint in openSprints() AND assignee = currentUser()'
+    local encoded_jql=$(echo "$jql" | jq -sRr @uri)
+    jira_api_get "/search?jql=${encoded_jql}&fields=key,summary,status&maxResults=100"
+}
+
+get_issue_worklogs() { jira_api_get "/issue/$1/worklog"; }
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Business Logic
+# ═══════════════════════════════════════════════════════════════════════════════
+
+get_user_logged_hours_for_date() {
+    local target_date="$1" output_mode="${2:-normal}"
+
+    validate_date_format "$target_date" || error_exit "Invalid date format: $target_date"
+
+    local jql="worklogAuthor=currentUser() AND worklogDate=$target_date"
+    local encoded_jql=$(echo "$jql" | jq -sRr @uri)
+    local issues_response=$(jira_api_get "/search?jql=${encoded_jql}&fields=key,summary&maxResults=1000")
+
+    is_valid_json "$issues_response" || error_exit "Invalid JSON response from Jira API"
+
+    local total_seconds=0 worklog_entries=()
+
+    exec 3>&1 1>/dev/null
+
+    while IFS=$'\t' read -r ticket title; do
+        [[ -z "$ticket" ]] && continue
+
+        worklogs_response=$(get_issue_worklogs "$ticket" 2>/dev/null)
+        cleaned_worklogs=$(clean_json_response "$worklogs_response" 2>/dev/null)
+
+        if ! is_valid_json "$cleaned_worklogs"; then
+            exec 1>&3
+            [[ "$output_mode" != "quiet" ]] && warn "Skipping $ticket - invalid worklog data"
+            exec 1>/dev/null
+            continue
+        fi
+
+        issue_seconds_raw=$(echo "$cleaned_worklogs" | jq -r \
+            --arg date "$target_date" --arg username "$JIRA_USERNAME" \
+            '.worklogs[] | select(.author.name == $username and (.started | startswith($date))) | .timeSpentSeconds' 2>/dev/null)
+
+        issue_seconds=$(echo "$issue_seconds_raw" | sum_numbers 2>/dev/null)
+
+        if [[ "$issue_seconds" -gt 0 ]] 2>/dev/null; then
+            total_seconds=$((total_seconds + issue_seconds))
+            issue_hours=$(seconds_to_hours "$issue_seconds" 2>/dev/null)
+            worklog_entries+=("$ticket|$title|$issue_hours")
+        fi
+    done < <(echo "$issues_response" | jq -r '.issues[] | "\(.key)\t\(.fields.summary)"' 2>/dev/null)
+
+    exec 1>&3
+
+    local total_hours=$(seconds_to_hours "$total_seconds")
+
+    case "$output_mode" in
+        "numeric"|"quiet") echo "$total_hours" ;;
+        *) display_worklog_summary "$target_date" "$total_hours" "${worklog_entries[@]}" ;;
+    esac
+}
+
+display_worklog_summary() {
+    local target_date="$1" total_hours="$2"
+    shift 2; local worklog_entries=("$@")
+
+    info "\n🗓 Worklog details for $target_date"
+    info "────────────────────────────────"
+
+    if [[ ${#worklog_entries[@]} -eq 0 ]]; then
+        info "No work logged for this date."
+        return
+    fi
+
+    if $g_verbose_mode; then
+        printf '┌───────────────┬──────────────────────────────────────────┬────────────┬────────┐\n'
+        printf '│ %-13s │ %-40s │ %-10s │ %6s │\n' "Ticket" "Title" "Date" "Hours"
+        printf '├───────────────┼──────────────────────────────────────────┼────────────┼────────┤\n'
+        for entry in "${worklog_entries[@]}"; do
+            IFS='|' read -r ticket title hours <<< "$entry"
+            printf '│ %-13s │ %-40s │ %-10s │ %6s │\n' "$ticket" "${title:0:40}" "$target_date" "$hours"
+        done
+        printf '└───────────────┴──────────────────────────────────────────┴────────────┴────────┘\n'
+    else
+        for entry in "${worklog_entries[@]}"; do
+            IFS='|' read -r ticket title hours <<< "$entry"
+            printf "%-12s %6s hrs\n" "$ticket" "$hours"
+        done
+        info "────────────────────────────────"
+    fi
+
+    info "Total logged hours: $total_hours"
+}
+
+log_work_time_for_date() {
+    local ticket="$1" time_hours="$2" log_date="$3" comment="$4"
+
+    validate_date_format "$log_date" || error_exit "Invalid date format: $log_date"
+    validate_time_format "$time_hours" || error_exit "Invalid time format: $time_hours"
+
+    # Check daily limit
+    local already_logged=$(get_user_logged_hours_for_date "$log_date" "numeric")
+    local new_total=$(echo "$already_logged + $time_hours" | bc)
+
+    if (( $(echo "$new_total > $MAX_DAILY_HOURS" | bc -l) )); then
+        warn "Already logged ${already_logged}h on $log_date. Adding ${time_hours}h would exceed ${MAX_DAILY_HOURS}h limit."
+        return 1
+    fi
+
+    # Prepare and submit worklog
+    local start_time="${log_date}T${DEFAULT_TIME}:00.000+0000"
+    local worklog_data
+
+    if [[ -n "$comment" ]]; then
+        worklog_data=$(jq -n --arg started "$start_time" --arg timeSpent "${time_hours}h" --arg comment "$comment" \
+            '{started: $started, timeSpent: $timeSpent, comment: $comment}')
+    else
+        worklog_data=$(jq -n --arg started "$start_time" --arg timeSpent "${time_hours}h" \
+            '{started: $started, timeSpent: $timeSpent}')
+    fi
+
+    local response=$(jira_api_post "/issue/$ticket/worklog" "$worklog_data")
+
+    if echo "$response" | jq -e '.id' >/dev/null 2>&1; then
+        info "✅ Logged ${time_hours}h on $ticket for $log_date at $DEFAULT_TIME"
+    else
+        error_exit "Failed to log work on $log_date: $response"
+    fi
+}
+
+log_work_time_for_range() {
+    local ticket="$1" time_hours="$2" date_range="$3" comment="$4"
+
+    [[ "$date_range" =~ ^([0-9]{4}-[0-9]{2}-[0-9]{2})\.\.([0-9]{4}-[0-9]{2}-[0-9]{2})$ ]] ||
+        error_exit "Invalid date range format. Use: YYYY-MM-DD..YYYY-MM-DD"
+
+    local start_date="${match[1]}" end_date="${match[2]}"
+    validate_date_format "$start_date" || error_exit "Invalid start date: $start_date"
+    validate_date_format "$end_date" || error_exit "Invalid end date: $end_date"
+
+    local current_date="$start_date" success_count=0 total_count=0
+
+    while [[ "$current_date" != "$(date -j -v+1d -f "%Y-%m-%d" "$end_date" +%Y-%m-%d)" ]]; do
+        ((total_count++))
+        log_work_time_for_date "$ticket" "$time_hours" "$current_date" "$comment" && ((success_count++))
+        current_date=$(date -j -v+1d -f "%Y-%m-%d" "$current_date" +%Y-%m-%d)
+    done
+
+    info "Completed: $success_count/$total_count days logged successfully"
+}
+
+display_suggested_tickets() {
+    local response=$(get_current_user_sprint_issues)
+    is_valid_json "$response" || error_exit "Failed to retrieve sprint issues"
+
+    local issue_count=$(echo "$response" | jq '.issues | length')
+    [[ "$issue_count" -eq 0 ]] && { info "No issues found in open sprints assigned to you."; return; }
+
+    info ""
+    if $g_verbose_mode; then
+        printf '┌───────────────┬────────────────────────────────┬────────────────────┐\n'
+        printf '│ %-13s │ %-30s │ %-18s │\n' "Ticket" "Title" "Status"
+        printf '├───────────────┼────────────────────────────────┼────────────────────┤\n'
+        echo "$response" | jq -r '.issues[] | [.key, (.fields.summary[:30]), .fields.status.name] | @tsv' | \
+            while IFS=$'\t' read -r ticket title ticket_status; do
+                printf '│ %-13s │ %-30s │ %-18s │\n' "$ticket" "$title" "$ticket_status"
+            done
+        printf '└───────────────┴────────────────────────────────┴────────────────────┘\n'
+    else
+        printf '┌───────────────┬────────────────────┐\n'
+        printf '│ %-13s │ %-18s │\n' "Ticket" "Status"
+        printf '├───────────────┼────────────────────┤\n'
+        echo "$response" | jq -r '.issues[] | [.key, .fields.status.name] | @tsv' | \
+            while IFS=$'\t' read -r ticket ticket_status; do
+                printf '│ %-13s │ %-18s │\n' "$ticket" "$ticket_status"
+            done
+        printf '└───────────────┴────────────────────┘\n'
+    fi
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Command Handlers
+# ═══════════════════════════════════════════════════════════════════════════════
+
+handle_status_command() {
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -date) [[ -z "${2:-}" ]] && error_exit "Option -date requires a value"; g_date="$2"; shift 2 ;;
+            -v|--verbose) g_verbose_mode=true; shift ;;
+            *) error_exit "Unknown option for 'status': $1" ;;
+        esac
+    done
+    get_user_logged_hours_for_date "$g_date"
+}
+
+handle_log_command() {
+    local date_specified=false range_specified=false
+
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -ticket) [[ -z "${2:-}" ]] && error_exit "Option -ticket requires a value"; g_ticket="$2"; shift 2 ;;
+            -time) [[ -z "${2:-}" ]] && error_exit "Option -time requires a value"; g_time="$2"; shift 2 ;;
+            -date) [[ -z "${2:-}" ]] && error_exit "Option -date requires a value"; g_date="$2"; date_specified=true; shift 2 ;;
+            -range) [[ -z "${2:-}" ]] && error_exit "Option -range requires a value"; g_range="$2"; range_specified=true; shift 2 ;;
+            -comment) [[ -z "${2:-}" ]] && error_exit "Option -comment requires a value"; g_comment="$2"; shift 2 ;;
+            *) error_exit "Unknown option for 'log': $1" ;;
+        esac
+    done
+
+    [[ -z "$g_ticket" ]] && error_exit "Missing required option: -ticket"
+    [[ -z "$g_time" ]] && error_exit "Missing required option: -time"
+    $date_specified && $range_specified && error_exit "Cannot specify both -date and -range options"
+
+    if $range_specified; then
+        log_work_time_for_range "$g_ticket" "$g_time" "$g_range" "$g_comment"
+    else
+        log_work_time_for_date "$g_ticket" "$g_time" "$g_date" "$g_comment"
+    fi
+}
+
+handle_suggest_command() {
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -v|--verbose) g_verbose_mode=true; shift ;;
+            *) error_exit "Unknown option for 'suggest': $1" ;;
+        esac
+    done
+    display_suggested_tickets
+}
+
+show_usage() {
+    cat << 'EOF'
+Jira Time Logger - A streamlined CLI tool for Jira worklog management
+
+USAGE:
+    jira <command> [options]
+
+COMMANDS:
+    status      Show logged work time for a date
+    log         Log work time to a Jira ticket
+    suggest     Show available tickets from current sprints
+    -version    Show version information
+
+OPTIONS:
+    status:
+        -date YYYY-MM-DD    Target date (default: today)
+        -v, --verbose       Show detailed table format
+
+    log:
+        -ticket TICKET_ID   Jira ticket identifier (required)
+        -time HOURS         Time in decimal hours (required)
+        -date YYYY-MM-DD    Target date (default: today)
+        -range START..END   Date range (YYYY-MM-DD..YYYY-MM-DD)
+        -comment "text"     Work description
+
+    suggest:
+        -v, --verbose       Show detailed ticket information
+
+EXAMPLES:
+    jira status -date 2024-01-15
+    jira log -ticket ABC-123 -time 2.5 -comment "Fixed authentication bug"
+    jira log -ticket DEF-456 -time 1.0 -range 2024-01-01..2024-01-05
+    jira suggest -v
+
+CONFIGURATION:
+    Set up ~/.script/core.sh with your Jira credentials:
+    - JIRA_BASE_URL (e.g., https://company.atlassian.net/rest/api/2)
+    - JIRA_API_TOKEN (generate at id.atlassian.com)
+    - JIRA_USERNAME (your Jira username)
+    - JIRA_DEFAULT_TIME (optional, default: 09:00)
+
+EOF
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Main Entry Point
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Validate environment
+[[ -z "${JIRA_API_TOKEN:-}" ]] && error_exit "JIRA_API_TOKEN environment variable not set"
+[[ -z "${JIRA_BASE_URL:-}" ]] && error_exit "JIRA_BASE_URL environment variable not set"
+[[ -z "${JIRA_USERNAME:-}" ]] && error_exit "JIRA_USERNAME environment variable not set"
+
+# Check dependencies
+for cmd in curl jq bc; do
+    command -v "$cmd" >/dev/null || error_exit "$cmd is required but not installed"
+done
+
+# Command dispatch
+case "${1:-}" in
+    status) shift; handle_status_command "$@" ;;
+    log) shift; handle_log_command "$@" ;;
+    suggest) shift; handle_suggest_command "$@" ;;
+    -version) echo "$SCRIPT_NAME version: $VERSION" ;;
+    ""|--help|-h) show_usage ;;
+    *) error_exit "Unknown command: $1"$'\n'"Run '$SCRIPT_NAME --help' for usage information." ;;
+esac
+

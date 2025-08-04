@@ -1,0 +1,81 @@
+name: Release Jira Time Logger
+
+on:
+  workflow_dispatch:
+    inputs:
+      next_version:
+        description: 'Optional: Set the next snapshot version (e.g., 2.0.0)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Release & Bump
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Get current and clean version
+        id: version
+        run: |
+          raw_version=$(grep 'readonly VERSION=' jira | cut -d'"' -f2)
+          clean_version=$(echo "$raw_version" | sed 's/-SNAPSHOT//')
+          echo "raw_version=$raw_version" >> "$GITHUB_OUTPUT"
+          echo "clean_version=$clean_version" >> "$GITHUB_OUTPUT"
+
+      - name: Check if release tag exists
+        id: check_tag
+        run: |
+          if git rev-parse "v${{ steps.version.outputs.clean_version }}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create GitHub Release
+        if: steps.check_tag.outputs.exists == 'false'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.clean_version }}
+          name: Jira Time Logger v${{ steps.version.outputs.clean_version }}
+          body: |
+            ## What’s New
+            Release generated from version `${{ steps.version.outputs.raw_version }}`
+
+            Recent commits:
+            ${{ steps.changelog.outputs.commits }}
+          files: |
+            jira
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Bump to next snapshot version
+        id: bump
+        run: |
+          # Use input version if provided
+          if [[ -n "${{ github.event.inputs.next_version }}" ]]; then
+            new_version="${{ github.event.inputs.next_version }}-SNAPSHOT"
+          else
+            IFS='.' read -r major minor patch <<< "${{ steps.version.outputs.clean_version }}"
+            minor=$((minor + 1))
+            new_version="${major}.${minor}.0-SNAPSHOT"
+          fi
+
+          echo "new_version=$new_version" >> "$GITHUB_OUTPUT"
+
+          # Replace version in script
+          sed -i.bak "s/readonly VERSION=\".*\"/readonly VERSION=\"${new_version}\"/" jira
+          rm jira.bak
+
+      - name: Commit version bump
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add jira
+          git commit -m "🔄 Bump version to ${{ steps.bump.outputs.new_version }}"
+          git push origin main
