@@ -14,7 +14,7 @@ fi
 
 # Constants
 readonly SCRIPT_NAME="$(basename "$0")"
-readonly VERSION="1.0.0-SNAPSHOT"
+readonly VERSION="1.1.0-SNAPSHOT"
 readonly DEFAULT_TIME="${JIRA_DEFAULT_TIME:-09:00}"
 readonly MAX_DAILY_HOURS=8
 
